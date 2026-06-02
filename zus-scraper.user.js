@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         ZUS eZUS Scraper
 // @namespace    http://tampermonkey.net/
-// @version      0.2.1
+// @version      0.2.0
 // @description  Zbiera salda i wpłaty z kont płatników w ZUS
 // @author       Dmytro Tiaptia
+// @updateURL    https://github.com/tiaptiad/tampermonkey-scripts/blob/main/zus-scraper.user.js
+// @downloadURL  https://github.com/tiaptiad/tampermonkey-scripts/blob/main/zus-scraper.user.js
 // @match        https://www.zus.pl/ezus/*
 // @grant        GM_setValue
 // @grant        GM_getValue
