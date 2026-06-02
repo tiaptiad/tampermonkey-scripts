@@ -1,1 +1,1 @@
-[!["Install ZUS scrapper"](https://img.shields.io/badge/Install-Tampermonkey-green)](https://github.com/tiaptiad/tampermonkey-scripts/blob/af491acd93beed4a244e963a89e876696c54faef/zus-scraper.user.js)
+[!['Install ZUS scrapper'](https://img.shields.io/badge/Install-Tampermonkey-green)](https://github.com/tiaptiad/tampermonkey-scripts/blob/af491acd93beed4a244e963a89e876696c54faef/zus-scraper.user.js)
