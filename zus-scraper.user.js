@@ -542,7 +542,7 @@
   </div>
     <div class="slider-row">
       <label class="opt" for="rangeWait">Czas oczekiwania na wpłaty:</label>
-      <input type="range" id="rangeWait" min="1" max="5" step="1" value="1">
+      <input type="range" id="rangeWait" min="1" max="5" step="1" value="2">
       <span id="rangeWaitVal">1&nbsp;s</span>
     </div>
   <div class="divider"></div>
