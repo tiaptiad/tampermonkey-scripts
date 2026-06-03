@@ -4,8 +4,8 @@
 // @version      4
 // @description  Zbiera salda i wpłaty z kont płatników w ZUS
 // @author       Dmytro Tiaptia
-// @updateURL    https://raw.githubusercontent.com/tiaptiad/tampermonkey-scripts/main/zus-scraper.user.js
-// @downloadURL  https://raw.githubusercontent.com/tiaptiad/tampermonkey-scripts/main/zus-scraper.user.js
+// @updateURL    https://cdn.jsdelivr.net/gh/tiaptiad/tampermonkey-scripts@latest/zus-scraper.user.js
+// @downloadURL  https://cdn.jsdelivr.net/gh/tiaptiad/tampermonkey-scripts@latest/zus-scraper.user.js
 // @match        https://www.zus.pl/ezus/*
 // @grant        GM_setValue
 // @grant        GM_getValue
