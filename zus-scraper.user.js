@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         ZUS eZUS Scraper
 // @namespace    http://tampermonkey.net/
-// @version      0.2.1
+// @version      1.3.0
 // @description  Zbiera salda i wpłaty z kont płatników w ZUS
 // @author       Dmytro Tiaptia
-// @updateURL    https://github.com/tiaptiad/tampermonkey-scripts/blob/main/zus-scraper.user.js
-// @downloadURL  https://github.com/tiaptiad/tampermonkey-scripts/blob/main/zus-scraper.user.js
+// @updateURL    https://raw.githubusercontent.com/tiaptiad/tampermonkey-scripts/main/zus-scraper.user.js
+// @downloadURL  https://raw.githubusercontent.com/tiaptiad/tampermonkey-scripts/main/zus-scraper.user.js
 // @match        https://www.zus.pl/ezus/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -38,7 +38,6 @@
   }
 
   // ─── SESSION IGNORE LIST (tylko pamięć okna UI) ──────────────────────────────
-  // Przechowywana w window opener lub przekazywana przez broadcastchannel
   const channel = new BroadcastChannel('zus_scraper');
 
   // ─── HELPERS ────────────────────────────────────────────────────────────────
@@ -83,6 +82,65 @@
     return negative ? -value : value;
   }
 
+  // Czeka aż spinner w danym kontenerze pojawi się i zniknie
+  function waitForSpinnerToFinish(containerSelector, timeout = 15000) {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => { observer.disconnect(); resolve(); }, timeout);
+
+      function check() {
+        const container = document.querySelector(containerSelector);
+        if (!container) return;
+        const spinner = container.querySelector(".eds-data-grid-data-loading-spinner");
+        if (!spinner || spinner.classList.contains("hidden")) {
+          clearTimeout(timer);
+          observer.disconnect();
+          resolve();
+        }
+      }
+
+      const observer = new MutationObserver(check);
+      observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["class"] });
+      check();
+    });
+  }
+
+
+  // Czeka aż sekcja Wpłaty załaduje prawdziwe dane lub potwierdzi brak wpłat.
+  // Strategia: najpierw czeka na zniknięcie spinnera, potem sprawdza czy
+  // pojawił się tbody tr (wpłaty) lub ec-empty-state (brak wpłat).
+  // Jeśli po zniknięciu spinnera nadal brak obu — czeka max 10s na tbody tr.
+  async function waitForPaymentsReady(timeout = 10000) {
+    const container = "ezus-platnik-payments";
+    await waitForSpinnerToFinish(container);
+    await sleep(200); // krótki bufor po spinnerie
+
+    // Sprawdź stan po spinnerie
+    const section = document.querySelector(container);
+    if (!section) return;
+
+    const hasRows     = !!section.querySelector("tbody tr");
+    const hasEmpty    = !!section.querySelector("ec-empty-state");
+    const hasSpinner  = !!section.querySelector(".eds-data-grid-data-loading-spinner:not(.hidden)");
+
+    // Dane już są — gotowe
+    if (hasRows) return;
+
+    // Spinner znowu aktywny (Angular odświeża) — czekaj ponownie
+    if (hasSpinner) {
+      await waitForSpinnerToFinish(container);
+      await sleep(200);
+    }
+
+    // Jeśli empty state bez aktywnego spinnera — to prawdziwy brak wpłat
+    if (hasEmpty && !section.querySelector(".eds-data-grid-data-loading-spinner:not(.hidden)")) return;
+
+    // Ostateczne czekanie na tbody tr z timeoutem
+    try {
+      await waitForElement(container + " tbody tr", timeout);
+    } catch (_) {
+      // timeout — akceptujemy 0 wpłat
+    }
+  }
   function clickElement(el) {
     el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
   }
@@ -93,7 +151,7 @@
     channel.postMessage({ type: 'log', text: 'Zbieram listę kont...' });
 
     await waitForElement('tr[data-testid="authorized-accounts-row"]');
-    await sleep(500); // daj Angular chwilę na wyrenderowanie wszystkich wierszy
+    await sleep(500);
 
     const rows = document.querySelectorAll('tr[data-testid="authorized-accounts-row"]');
     const accounts = [];
@@ -122,12 +180,10 @@
   // ─── NAWIGACJA DO LISTY KONT ─────────────────────────────────────────────────
 
   async function goToAccountList() {
-    // Otwórz panel kontekstowy
     const profileBtn = await waitForElement('button[aria-label^="Otwórz panel kontekstowy"]');
     clickElement(profileBtn);
     await sleep(600);
 
-    // Kliknij "Wszystkie dostępne konta"
     const allAccountsBtn = await waitForElement('button .p-button-label');
     const btns = document.querySelectorAll('.p-button-label');
     const targetBtn = [...btns].find(el => el.textContent.includes('Wszystkie dostępne konta'));
@@ -140,7 +196,7 @@
 
   // ─── FAZA 2: PRZETWÓRZ JEDNO KONTO ──────────────────────────────────────────
 
-  async function processAccount(index, ignoredNips) {
+  async function processAccount(index, ignoredNips, waitDelay = 1000) {
     const state = await loadState();
     const account = state.accounts[index];
     if (!account) return;
@@ -148,12 +204,10 @@
     channel.postMessage({ type: 'status', index, status: 'in_progress' });
     channel.postMessage({ type: 'log', text: `Przetwarzam: ${account.name}` });
 
-    // Upewnij się że jesteśmy na liście kont
     if (!location.href.includes('/ezus/wybor-kontekstu')) {
       await goToAccountList();
     }
 
-    // Znajdź wiersz konta po NIP
     await waitForElement('tr[data-testid="authorized-accounts-row"]');
     await sleep(500);
 
@@ -169,7 +223,6 @@
 
     if (!targetRow) throw new Error(`Nie znaleziono wiersza dla NIP: ${account.nip}`);
 
-    // Kliknij "Zobacz szczegóły"
     const detailBtn = targetRow.querySelector('button[aria-label="Zobacz szczegóły"]');
     if (!detailBtn) throw new Error('Nie znaleziono przycisku "Zobacz szczegóły"');
     clickElement(detailBtn);
@@ -177,7 +230,6 @@
     await waitForURL('/ezus/obszar-platnika/platnik/dashboard');
     await sleep(800);
 
-    // Kliknij tab "Należne składki i wpłaty"
     await waitForElement('.tab-label');
     const tabs = document.querySelectorAll('.tab-label');
     const targetTab = [...tabs].find(el => el.textContent.includes('Należne składki i wpłaty'));
@@ -187,7 +239,6 @@
     await waitForURL('zakladka=Nalezne_skladki_i_wplaty');
     await sleep(1000);
 
-    // Odczytaj saldo miesięczne
     await waitForElement('.balance-column');
     const balanceCols = document.querySelectorAll('.balance-column');
     let winien = 0;
@@ -200,18 +251,19 @@
       if (label.includes('Nadpłata')) ma = parseAmount(value);
     });
 
-    // Saldo: Winien już jest ujemny (parseAmount zwraca -12867.82),
-    // Ma jest dodatni. Jeśli oba są 0, saldo = 0.
     let saldo;
     if (winien < 0) {
-      saldo = winien; // już ujemny
+      saldo = winien;
     } else if (ma > 0) {
-      saldo = ma;     // nadpłata
+      saldo = ma;
     } else {
       saldo = 0;
     }
 
-    // Odczytaj tabelkę wpłat
+    // Czekaj na nagłówek "Wpłaty", potem 3s bufor, potem odczytaj
+    await waitForElement('ezus-platnik-payments .header-label-text');
+    await sleep(waitDelay);
+
     const payments = [];
     const tables = document.querySelectorAll('table[id]');
     for (const table of tables) {
@@ -230,7 +282,6 @@
 
     const paymentsSum = payments.reduce((sum, p) => sum + p.amount, 0);
 
-    // Zapisz wynik
     state.accounts[index] = {
       ...account,
       status: 'done',
@@ -249,7 +300,7 @@
   // ─── EXPORT XLSX ────────────────────────────────────────────────────────────
 
   function generateXLSX(accounts) {
-    const headers = ['Nazwa', 'NIP', 'Saldo (zł)', 'Suma wpłat (zł)', 'Data wpłaty', 'Kwota wpłaty (zł)'];
+    const headers = ['Nazwa', 'PESEL/NIP', 'Saldo (zł)', 'Suma wpłat (zł)', 'Data wpłaty', 'Kwota wpłaty (zł)'];
     const rows = [];
 
     accounts.filter(a => a.status === 'done').forEach(a => {
@@ -264,17 +315,15 @@
 
     const ws = XLSX.utils.aoa_to_sheet([headers, ...rows]);
 
-    // Szerokości kolumn
     ws['!cols'] = [
       { wch: 32 }, // Nazwa
-      { wch: 14 }, // NIP
+      { wch: 14 }, // PESEL/NIP
       { wch: 14 }, // Saldo
       { wch: 16 }, // Suma wpłat
       { wch: 13 }, // Data wpłaty
       { wch: 18 }, // Kwota wpłaty
     ];
 
-    // Zamroź pierwszy wiersz
     ws['!freeze'] = { xSplit: 0, ySplit: 1 };
 
     const wb = XLSX.utils.book_new();
@@ -282,14 +331,13 @@
     return wb;
   }
 
-  // ─── GŁÓWNA LOGIKA (uruchamiana na każdej stronie ZUS) ───────────────────────
+  // ─── GŁÓWNA LOGIKA ───────────────────────────────────────────────────────────
 
   async function main() {
     const state = await loadState();
 
-    // Słuchaj komend z okna UI
     channel.onmessage = async (e) => {
-      const { type, index, ignoredNips } = e.data;
+      const { type, index, ignoredNips, waitDelay } = e.data;
 
       if (type === 'collect') {
         await collectAccounts();
@@ -297,7 +345,7 @@
 
       if (type === 'process') {
         try {
-          await processAccount(index, ignoredNips || []);
+          await processAccount(index, ignoredNips || [], waitDelay || 1000);
           channel.postMessage({ type: 'processed', index });
         } catch (err) {
           channel.postMessage({ type: 'error', index, text: err.message });
@@ -322,15 +370,13 @@
       }
     };
 
-    // Przy pierwszym załadowaniu wyślij aktualny stan do UI
     channel.postMessage({ type: 'state', state });
   }
 
   main();
 
-  // ─── OTWÓRZ OKNO UI ─────────────────────────────────────────────────────────
+  // ─── LAUNCHER ───────────────────────────────────────────────────────────────
 
-  // Przycisk otwierający panel — widoczny na każdej stronie
   const launcher = document.createElement('button');
   launcher.textContent = '📋 ZUS Scraper';
   launcher.style.cssText = `
@@ -398,145 +444,64 @@
     height: 100vh;
   }
 
-  h1 {
-    font-size: 16px;
-    font-weight: 700;
-    color: var(--blue);
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
+  h1 { font-size: 16px; font-weight: 700; color: var(--blue); display: flex; align-items: center; gap: 8px; }
 
-  .card {
-    background: white;
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 12px 14px;
-  }
+  .card { background: white; border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; }
 
-  .row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
+  .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .row-between { display: flex; align-items: center; justify-content: space-between; }
 
-  .row-between {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }
-
-  button {
-    border: none;
-    border-radius: 6px;
-    padding: 7px 14px;
-    font-size: 12px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: opacity .15s;
-  }
+  button { border: none; border-radius: 6px; padding: 7px 14px; font-size: 12px; font-weight: 600; cursor: pointer; transition: opacity .15s; }
   button:hover { opacity: .85; }
   button:disabled { opacity: .4; cursor: not-allowed; }
 
-  .btn-primary { background: var(--blue); color: white; }
-  .btn-success { background: var(--green); color: white; }
-  .btn-danger  { background: var(--red);   color: white; }
+  .btn-primary { background: var(--blue);       color: white; }
+  .btn-success { background: var(--green);      color: white; }
+  .btn-danger  { background: var(--red);        color: white; }
   .btn-ghost   { background: var(--gray-light); color: var(--text); }
-  .btn-export  { background: var(--blue); color: white; }
+  .btn-export  { background: var(--blue);       color: white; }
 
-  .counter {
-    font-size: 12px;
-    color: var(--gray);
-  }
+  .counter { font-size: 12px; color: var(--gray); }
 
-  /* Tabela kont */
-  .accounts-wrapper {
-    height: 220px;
-    overflow-y: auto;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    margin-top: 8px;
-  }
+  .accounts-wrapper { height: 220px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; margin-top: 8px; }
 
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 12px;
-  }
-
-  thead th {
-    background: var(--gray-light);
-    padding: 6px 8px;
-    text-align: left;
-    font-weight: 600;
-    position: sticky;
-    top: 0;
-    z-index: 1;
-    border-bottom: 1px solid var(--border);
-  }
-
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  thead th { background: var(--gray-light); padding: 6px 8px; text-align: left; font-weight: 600; position: sticky; top: 0; z-index: 1; border-bottom: 1px solid var(--border); }
   tbody tr { border-bottom: 1px solid var(--border); }
   tbody tr:last-child { border-bottom: none; }
   tbody td { padding: 5px 8px; vertical-align: middle; }
   tbody tr:hover { background: var(--blue-light); }
 
-  .badge {
-    display: inline-block;
-    padding: 2px 7px;
-    border-radius: 12px;
-    font-size: 11px;
-    font-weight: 600;
-  }
-  .badge-pending   { background: var(--gray-light);   color: var(--gray); }
-  .badge-progress  { background: var(--orange-light);  color: var(--orange); }
-  .badge-done      { background: var(--green-light);   color: var(--green); }
-  .badge-ignored   { background: #f3f4f6; color: #9ca3af; text-decoration: line-through; }
-  .badge-error     { background: #fee2e2; color: var(--red); }
+  .badge { display: inline-block; padding: 2px 7px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+  .badge-pending  { background: var(--gray-light);  color: var(--gray); }
+  .badge-progress { background: var(--orange-light); color: var(--orange); }
+  .badge-done     { background: var(--green-light);  color: var(--green); }
+  .badge-ignored  { background: #f3f4f6; color: #9ca3af; text-decoration: line-through; }
+  .badge-error    { background: #fee2e2; color: var(--red); }
 
   .saldo-pos { color: var(--green); font-weight: 600; }
   .saldo-neg { color: var(--red);   font-weight: 600; }
 
-  /* Checkboxy opcji */
   .options { display: flex; flex-direction: column; gap: 6px; }
-  label.opt {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    cursor: pointer;
-    font-size: 12px;
-  }
+  label.opt { display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 12px; }
   input[type=checkbox] { accent-color: var(--blue); width: 14px; height: 14px; }
-
-  /* Czerwone chcekboxy ignorowania */
   #accountsTable input[type=checkbox] { accent-color: var(--red); }
 
-  /* Log */
-  #log {
-    flex: 1;
-    overflow-y: auto;
-    font-size: 11px;
-    font-family: 'Consolas', monospace;
-    color: #374151;
-    background: #f9fafb;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 8px;
-    line-height: 1.6;
-  }
-
+  #log { flex: 1; overflow-y: auto; font-size: 11px; font-family: 'Consolas', monospace; color: #374151; background: #f9fafb; border: 1px solid var(--border); border-radius: 6px; padding: 8px; line-height: 1.6; }
   .log-entry { margin-bottom: 2px; }
   .log-entry.error { color: var(--red); }
   .log-entry.ok { color: var(--green); }
 
   .divider { height: 1px; background: var(--border); margin: 4px 0; }
+  .slider-row { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+  .slider-row input[type=range] { flex: 1; accent-color: var(--blue); cursor: pointer; }
+  .slider-row span { font-size: 12px; color: var(--gray); min-width: 28px; text-align: right; }
 </style>
 </head>
 <body>
 
 <h1>📋 ZUS Scraper</h1>
 
-<!-- Faza 1 -->
 <div class="card">
   <div class="row-between">
     <div class="row">
@@ -545,29 +510,25 @@
     </div>
     <span class="counter" id="counter">Brak danych</span>
   </div>
-
   <div class="accounts-wrapper">
     <table id="accountsTable">
       <thead>
         <tr>
           <th style="width:30px">Ignoruj</th>
           <th>Nazwa</th>
-          <th>NIP</th>
+          <th>PESEL/NIP</th>
           <th>Status</th>
           <th>Saldo</th>
           <th>Suma wpłat</th>
         </tr>
       </thead>
       <tbody id="accountsBody">
-        <tr><td colspan="5" style="text-align:center;color:#9ca3af;padding:20px">
-          Kliknij "Stwórz listę kont"
-        </td></tr>
+        <tr><td colspan="6" style="text-align:center;color:#9ca3af;padding:20px">Kliknij "Stwórz listę kont"</td></tr>
       </tbody>
     </table>
   </div>
 </div>
 
-<!-- Opcje + Start/Stop -->
 <div class="card">
   <div class="options">
     <label class="opt">
@@ -576,18 +537,22 @@
     </label>
     <label class="opt">
       <input type="checkbox" id="chkAutoExport" checked>
-      Auto-export — pobiera plik CSV po zakończeniu wszystkich kont (wymaga Auto-continue)
+      Auto-export — pobiera plik XLSX po zakończeniu wszystkich kont (wymaga Auto-continue)
     </label>
   </div>
+    <div class="slider-row">
+      <label class="opt" for="rangeWait">Czas oczekiwania na wpłaty:</label>
+      <input type="range" id="rangeWait" min="1" max="5" step="1" value="1">
+      <span id="rangeWaitVal">1&nbsp;s</span>
+    </div>
   <div class="divider"></div>
   <div class="row">
-    <button class="btn-success" id="btnStart" disabled>▶ Start</button>
-    <button class="btn-danger"  id="btnStop"  disabled>■ Stop</button>
+    <button class="btn-success" id="btnStart"  disabled>▶ Start</button>
+    <button class="btn-danger"  id="btnStop"   disabled>■ Stop</button>
     <button class="btn-export"  id="btnExport" disabled>⬇ Eksportuj teraz</button>
   </div>
 </div>
 
-<!-- Log -->
 <div id="log"></div>
 
 <script>
@@ -598,20 +563,25 @@
   let running = false;
   let stopped = false;
   let currentIndex = 0;
+  let waitDelay = 1000; // ms, kontrolowany przez suwak
 
-  // ── DOM refs ──
-  const tbody       = document.getElementById('accountsBody');
-  const counter     = document.getElementById('counter');
-  const btnCollect  = document.getElementById('btnCollect');
-  const btnReset    = document.getElementById('btnReset');
-  const btnStart    = document.getElementById('btnStart');
-  const btnStop     = document.getElementById('btnStop');
-  const btnExport   = document.getElementById('btnExport');
-  const chkAuto     = document.getElementById('chkAutoContinue');
-  const chkExport   = document.getElementById('chkAutoExport');
-  const log         = document.getElementById('log');
+  const tbody      = document.getElementById('accountsBody');
+  const counter    = document.getElementById('counter');
+  const btnCollect = document.getElementById('btnCollect');
+  const btnReset   = document.getElementById('btnReset');
+  const btnStart   = document.getElementById('btnStart');
+  const btnStop    = document.getElementById('btnStop');
+  const btnExport  = document.getElementById('btnExport');
+  const chkAuto    = document.getElementById('chkAutoContinue');
+  const chkExport  = document.getElementById('chkAutoExport');
+  const rangeWait    = document.getElementById('rangeWait');
+  const rangeWaitVal = document.getElementById('rangeWaitVal');
+  rangeWait.addEventListener('input', () => {
+    waitDelay = parseFloat(rangeWait.value) * 1000;
+    rangeWaitVal.textContent = rangeWait.value + ' s';
+  });
+  const log        = document.getElementById('log');
 
-  // ── Log ──
   function addLog(text, type = '') {
     const d = document.createElement('div');
     d.className = 'log-entry' + (type ? ' ' + type : '');
@@ -621,7 +591,6 @@
     log.scrollTop = log.scrollHeight;
   }
 
-  // ── Render tabeli ──
   function renderTable() {
     if (!accounts.length) {
       tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#9ca3af;padding:20px">Brak danych</td></tr>';
@@ -632,16 +601,16 @@
       const ignored = ignoredNips.has(a.nip);
       const status = ignored ? 'ignored' : a.status;
       const badge = {
-        pending:    '<span class="badge badge-pending">pending</span>',
-        in_progress:'<span class="badge badge-progress">⏳ w toku</span>',
-        done:       '<span class="badge badge-done">✓ done</span>',
-        ignored:    '<span class="badge badge-ignored">ignoruj</span>',
-        error:      '<span class="badge badge-error">błąd</span>',
+        pending:     '<span class="badge badge-pending">pending</span>',
+        in_progress: '<span class="badge badge-progress">⏳ w toku</span>',
+        done:        '<span class="badge badge-done">✓ done</span>',
+        ignored:     '<span class="badge badge-ignored">ignoruj</span>',
+        error:       '<span class="badge badge-error">błąd</span>',
       }[status] || '';
 
       let saldoHtml = '—';
       if (a.saldo !== null && a.saldo !== undefined) {
-        const cls = a.saldo >= 0 ? 'saldo-pos' : 'saldo-neg';
+        const cls  = a.saldo >= 0 ? 'saldo-pos' : 'saldo-neg';
         const sign = a.saldo > 0 ? '+' : '';
         saldoHtml = '<span class="' + cls + '">' + sign + Number(a.saldo).toFixed(2) + ' zł</span>';
       }
@@ -654,7 +623,7 @@
       return '<tr>' +
         '<td style="text-align:center"><input type="checkbox" ' + (ignored ? 'checked' : '') +
           ' onchange="toggleIgnore(' + i + ', this.checked)"></td>' +
-        '<td title="' + a.name + '">' + (a.name.length > 20 ? a.name.slice(0,20)+'…' : a.name) + '</td>' +
+        '<td title="' + a.name + '">' + (a.name.length > 20 ? a.name.slice(0,20) + '…' : a.name) + '</td>' +
         '<td>' + a.nip + '</td>' +
         '<td>' + badge + '</td>' +
         '<td>' + saldoHtml + '</td>' +
@@ -662,10 +631,9 @@
       '</tr>';
     }).join('');
 
-    const done = accounts.filter(a => a.status === 'done').length;
+    const done  = accounts.filter(a => a.status === 'done').length;
     const total = accounts.length;
     counter.textContent = total + ' kont | ' + done + ' done';
-
     btnStart.disabled  = running || !accounts.some(a => a.status === 'pending' && !ignoredNips.has(a.nip));
     btnExport.disabled = done === 0;
   }
@@ -677,7 +645,6 @@
     renderTable();
   };
 
-  // ── Pętla ──
   function nextPendingIndex() {
     return accounts.findIndex((a, i) => i >= currentIndex && a.status === 'pending' && !ignoredNips.has(a.nip));
   }
@@ -706,7 +673,7 @@
     currentIndex = idx;
     accounts[idx].status = 'in_progress';
     renderTable();
-    ch.postMessage({ type: 'process', index: idx, ignoredNips: [...ignoredNips] });
+    ch.postMessage({ type: 'process', index: idx, ignoredNips: [...ignoredNips], waitDelay: parseFloat(rangeWait.value) * 1000 });
   }
 
   function stopProcessing() {
@@ -714,14 +681,13 @@
     btnStop.disabled = true;
   }
 
-  // ── Export ──
   function exportNow() {
     ch.postMessage({ type: 'export_request' });
   }
 
   function downloadXLSX(base64data) {
     const binary = atob(base64data);
-    const bytes = new Uint8Array(binary.length);
+    const bytes  = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
     const blob = new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
     const url  = URL.createObjectURL(blob);
@@ -735,7 +701,17 @@
     URL.revokeObjectURL(url);
   }
 
-  // ── BroadcastChannel ──
+  function onAllDone() {
+    running = false;
+    btnStart.disabled = false;
+    btnStop.disabled  = true;
+    addLog('Wszystkie konta przetworzone!', 'ok');
+    if (chkAuto.checked && chkExport.checked) {
+      addLog('Auto-export: pobieranie pliku...');
+      exportNow();
+    }
+  }
+
   ch.onmessage = function(e) {
     const d = e.data;
 
@@ -753,6 +729,7 @@
       if (accounts[d.index]) {
         accounts[d.index].status = d.status;
         if (d.saldo !== undefined) accounts[d.index].saldo = d.saldo;
+        if (d.paymentsSum !== undefined) accounts[d.index].paymentsSum = d.paymentsSum;
       }
       renderTable();
     }
@@ -762,20 +739,11 @@
       if (d.paymentsSum !== undefined) accounts[d.index].paymentsSum = d.paymentsSum;
       renderTable();
 
-      // Auto-continue
       if (chkAuto.checked && !stopped) {
         currentIndex = d.index + 1;
         const nextIdx = accounts.findIndex((a, i) => i >= currentIndex && a.status === 'pending' && !ignoredNips.has(a.nip));
         if (nextIdx === -1) {
-          // Wszystkie done — zakończ i auto-export jeśli zaznaczony
-          running = false;
-          btnStart.disabled = false;
-          btnStop.disabled  = true;
-          addLog('Wszystkie konta przetworzone!', 'ok');
-          if (chkExport.checked) {
-            addLog('Auto-export: pobieranie pliku...');
-            exportNow();
-          }
+          onAllDone();
         } else {
           setTimeout(processNext, 800);
         }
@@ -791,19 +759,18 @@
       addLog('BŁĄD [' + (accounts[d.index]?.name || d.index) + ']: ' + d.text, 'error');
       renderTable();
 
-      // Mimo błędu idź dalej jeśli auto-continue
       if (chkAuto.checked && !stopped) {
         currentIndex = d.index + 1;
         const nextIdx = accounts.findIndex((a, i) => i >= currentIndex && a.status === 'pending' && !ignoredNips.has(a.nip));
         if (nextIdx === -1) {
-          running = false;
-          btnStart.disabled = false;
-          btnStop.disabled  = true;
           addLog('Przetwarzanie zakończone (z błędami).', 'ok');
           if (chkExport.checked) {
             addLog('Auto-export: pobieranie pliku...');
             exportNow();
           }
+          running = false;
+          btnStart.disabled = false;
+          btnStop.disabled  = true;
         } else {
           setTimeout(processNext, 800);
         }
@@ -816,7 +783,7 @@
 
     if (d.type === 'reset_done') {
       addLog('Stan wyczyszczony — kliknij "Stwórz listę kont" aby zacząć od nowa.');
-      btnStart.disabled = true;
+      btnStart.disabled  = true;
       btnExport.disabled = true;
     }
 
@@ -825,7 +792,6 @@
     }
   };
 
-  // ── Przyciski ──
   btnCollect.addEventListener('click', () => {
     accounts = [];
     renderTable();
@@ -848,7 +814,6 @@
   btnStop.addEventListener('click',   stopProcessing);
   btnExport.addEventListener('click', exportNow);
 
-  // ── Init: pobierz stan z karty ZUS ──
   ch.postMessage({ type: 'get_state' });
   addLog('Panel gotowy. Kliknij "Stwórz listę kont" aby rozpocząć.');
 </script>
